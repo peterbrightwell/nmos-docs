@@ -20,7 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: 3.x
-      - run: pip install zensical
+      - run: pip install zensical requests pyyaml toml
+
+      - name: Fetch NMOS specs
+        run: python scripts/fetch_specs.py
+
+      - name: Generate docs structure
+        run: python scripts/generate_docs.py
+
+      - name: Generate nav and combine config
+        run: python scripts/generate_nav.py
+
       - run: zensical build --clean
       - uses: actions/upload-pages-artifact@v4
         with:
