@@ -1,0 +1,11 @@
+# Cached repo docs
+/nmos_cache/
+
+# Generated docs
+/docs/
+
+# Zensical navigation, site and cache
+nav.toml
+zensical.toml
+/site/
+/.cache/
