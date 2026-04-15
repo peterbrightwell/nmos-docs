@@ -71,44 +71,22 @@ def save_file(path, content):
 # from urllib.parse import unquote  # Already imported above
 
 
-def get_github_file_sha(repo, branch, path):
-    # Use GitHub API to get file SHA
-    api_url = (
-        f"https://api.github.com/repos/AMWA-TV/{repo}/contents/{path}?ref={branch}"
-    )
-    r = requests.get(api_url, headers=github_headers())
-    if r.status_code == 200:
-        data = r.json()
-        if isinstance(data, dict):
-            return data.get("sha")
-    return None
+def get_repo_tree(repo, branch):
+    # Get the commit SHA for the branch
+    branch_url = f"https://api.github.com/repos/AMWA-TV/{repo}/branches/{branch}"
+    branch_resp = requests.get(branch_url, headers=github_headers())
+    if branch_resp.status_code != 200:
+        raise Exception(f"Failed to get branch info for {repo}:{branch}")
+    commit_sha = branch_resp.json()["commit"]["sha"]
 
-
-def fetch_and_save(repo, path, subpath="", branch="main", sha_cache=None):
-    """
-    Only fetches and saves if the SHA is not in the cache or has changed.
-    """
-    if sha_cache is None:
-        sha_cache = {}
-
-    cache_key = f"{repo}/{path}"
-    remote_sha = get_github_file_sha(repo, branch, path)
-    cached_sha = sha_cache.get(cache_key)
-
-    if remote_sha and cached_sha == remote_sha:
-        print(f"Skipping {cache_key} (SHA unchanged)")
-        return None  # Not refetched
-
-    url = GITHUB_RAW_BASE.format(repo=repo, branch=branch) + path
-    content = fetch_url(url)
-    if content:
-        # Decode any URL-encoded characters in the filename
-        filename = unquote(os.path.basename(path))
-        save_file(os.path.join(CACHE_DIR, repo, subpath, filename), content)
-        if remote_sha:
-            sha_cache[cache_key] = remote_sha
-        return content
-    return None
+    # Get the full tree
+    tree_url = f"https://api.github.com/repos/AMWA-TV/{repo}/git/trees/{commit_sha}?recursive=1"
+    tree_resp = requests.get(tree_url, headers=github_headers())
+    if tree_resp.status_code != 200:
+        raise Exception(f"Failed to get tree for {repo}:{branch}")
+    tree = tree_resp.json()["tree"]
+    # Map: path -> sha
+    return {entry["path"]: entry["sha"] for entry in tree if entry["type"] == "blob"}
 
 
 def fetch_spec_repo(repo, sha_cache):
@@ -116,69 +94,55 @@ def fetch_spec_repo(repo, sha_cache):
     repo_dir = os.path.join(CACHE_DIR, repo)
     os.makedirs(repo_dir, exist_ok=True)
 
-    # Determine correct branch from spec.yml
     branch = get_default_branch(repo)
     print(f"Using branch '{branch}' for repo '{repo}'")
 
+    # Get the full file tree (all SHAs in one go)
+    tree = get_repo_tree(repo, branch)
+
+    def fetch_if_needed(path, subpath=""):
+        cache_key = f"{repo}/{path}"
+        remote_sha = tree.get(path)
+        cached_sha = sha_cache.get(cache_key)
+        if not remote_sha:
+            print(f"File {path} not found in repo tree, skipping.")
+            return None
+        if cached_sha == remote_sha:
+            print(f"Skipping {cache_key} (SHA unchanged)")
+            return None
+        url = GITHUB_RAW_BASE.format(repo=repo, branch=branch) + path
+        content = fetch_url(url)
+        if content:
+            filename = unquote(os.path.basename(path))
+            save_file(os.path.join(CACHE_DIR, repo, subpath, filename), content)
+            sha_cache[cache_key] = remote_sha
+            return content
+        return None
+
     # 1. Main README
-    fetch_and_save(repo, "README.md", branch=branch, sha_cache=sha_cache)
+    fetch_if_needed("README.md")
 
     # 2. docs/README.md and referenced docs
-    docs_readme = fetch_and_save(
-        repo, "docs/README.md", "docs", branch=branch, sha_cache=sha_cache
-    )
+    docs_readme = fetch_if_needed("docs/README.md", "docs")
     if docs_readme:
-        # Find markdown links in docs/README.md
         import re
 
         md_links = re.findall(r"\[.*?\]\(([^)]+\.md)\)", docs_readme)
         for md_file in md_links:
-            fetch_and_save(
-                repo, f"docs/{md_file}", "docs", branch=branch, sha_cache=sha_cache
-            )
+            fetch_if_needed(f"docs/{md_file}", "docs")
 
-    # 3. APIs/ (RAML files)
+    # 3. APIs/ (RAML files and schemas)
     for apis_subdir in ["APIs", "API"]:
-        url = f"https://api.github.com/repos/AMWA-TV/{repo}/contents/{apis_subdir}?ref={branch}"
-        r = requests.get(url, headers=github_headers())
-        if r.status_code == 200:
-            for item in r.json():
-                if item["name"].endswith(".raml"):
-                    fetch_and_save(
-                        repo,
-                        f"{apis_subdir}/{item['name']}",
-                        apis_subdir,
-                        branch=branch,
-                        sha_cache=sha_cache,
-                    )
-                if item["type"] == "dir" and item["name"].lower() == "schemas":
-                    # Fetch schemas
-                    schemas_url = f"https://api.github.com/repos/AMWA-TV/{repo}/contents/{apis_subdir}/{item['name']}?ref={branch}"
-                    r2 = requests.get(schemas_url, headers=github_headers())
-                    if r2.status_code == 200:
-                        for schema in r2.json():
-                            if schema["name"].endswith(".json"):
-                                fetch_and_save(
-                                    repo,
-                                    f"{apis_subdir}/{item['name']}/{schema['name']}",
-                                    f"{apis_subdir}/schemas",
-                                    branch=branch,
-                                    sha_cache=sha_cache,
-                                )
+        for path in tree:
+            if path.startswith(f"{apis_subdir}/") and path.endswith(".raml"):
+                fetch_if_needed(path, apis_subdir)
+            if path.startswith(f"{apis_subdir}/schemas/") and path.endswith(".json"):
+                fetch_if_needed(path, f"{apis_subdir}/schemas")
 
     # 4. examples/
-    url = f"https://api.github.com/repos/AMWA-TV/{repo}/contents/examples?ref={branch}"
-    r = requests.get(url, headers=github_headers())
-    if r.status_code == 200:
-        for item in r.json():
-            if item["type"] == "file":
-                fetch_and_save(
-                    repo,
-                    f"examples/{item['name']}",
-                    "examples",
-                    branch=branch,
-                    sha_cache=sha_cache,
-                )
+    for path in tree:
+        if path.startswith("examples/") and "/" not in path[len("examples/") :]:
+            fetch_if_needed(path, "examples")
 
 
 def parse_args():
